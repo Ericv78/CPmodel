@@ -13,7 +13,7 @@ V = [
     (20, 10),  # node 6 
     (6, 1)     # node 7
 ]
-# ---------------- Demands (weights) ----------------
+#weights
 w = [
     0,   
     6,   
@@ -25,7 +25,7 @@ w = [
     1    
 ]
 
-# ---------------- Deadlines ----------------
+#deadlines
 D = {
     1: 100,  
     2: 110,  
@@ -36,7 +36,7 @@ D = {
     7: 40    
 }
 
-# ---------------- Parameters ----------------
+#parameters
 horizon = 150
 T = 150                        # Planning horizon (minutes)
 E = 35                         # Maximum drone endurance (minutes)
@@ -48,7 +48,7 @@ C = set(range(1, num_nodes))   # Affected areas (excluding depot)
 VL = set(range(num_nodes))     # Separation nodes (truck-accessible)
 VR = set(range(1, num_nodes))  # Rendezvous nodes (excluding depot)
 VT = {1, 2, 6}                 # truck-accessible affected areas
-VD = C.difference(VT)          # remaining affected areas served by drone
+VD = VT        # remaining affected areas served by drone
 n = len(C)
 
 WT_max = 15   # Truck capacity
@@ -127,7 +127,13 @@ for k in K:
 # (36) Each affected area visited at most once (truck or drone)
 for j in C:
     truck_part = sum(x[k, i, j] for k in K for i in VL if i != j)
-    drone_part = sum(y[k, i, j, l] for k in K for j in C for i in VL if i != j for l in VR if l != i)
+    drone_part = sum(
+        y_drone[k, i, j, l]
+        for k in K
+        for i in VL if i != j
+        for l in VR if l != i and l != j
+        if (k, i, j, l) in y_drone  # ensures j∈VD and variable was created
+    )
     model.Add(truck_part + drone_part <= 1)
 
 # (37, 38) Depot departure and return
@@ -144,11 +150,10 @@ for k in K:
 
 # (40) Trucks cannot reach road-damaged areas
 for k in K:
-    for i in VD:
-        for j in range(num_nodes):
-            if i != j and (k,i,j) in x:
-                model.Add(x[k,i,j] == 0)
-                model.Add(x[k,j,i] == 0)
+    for i in VT:
+        for j in VT:
+            if i != j:
+                model.Add(x[k, i, j] == 0)
 
 # (41,42) prevent the formation of subtours for the truck by ensuring that the truck does not traverse through previously visited arcs
 M = len(C)  # maximum number of customer nodes
@@ -265,7 +270,7 @@ for k in K:
                 )
             
 # (55, 56) similarly guarantee drone arrival time continuity, ensuring that a drone’s arrival at subsequent nodes is sequential
-# (55) a_i^k + t'_{ij} - T(1 - Σ_{l∈VR\{i,j}} y_{ijl}^k) ≤ a'_j^k   ∀k, i∈VL\{j}, j∈C\{i}
+# (55) 
 for k in K:
     for i in VL:
         for j in C:
@@ -280,7 +285,7 @@ for k in K:
                 sum_ijl = sum(flights_ijl)
                 model.Add(a[k, i] + t_prime[i][j] - T * (1 - sum_ijl) <= a_prime[k, j])
 
-# (56) a'_j^k + t'_{jl} - T(1 - Σ_{i∈VL\{j,l}} y_{ijl}^k) ≤ a_l^k   ∀k, j∈C\{l}, l∈VR\{j}
+# (56) 
 for k in K:
     for j in C:
         for l in VR:
@@ -416,7 +421,6 @@ solver.parameters.num_search_workers = 8
 status = solver.Solve(model)
 
 # ---------------- Solution Printer ----------------
-# ---------------- Solution Printer ----------------
 def print_solution_min(status):
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         print("Status:", solver.StatusName(status))
@@ -425,25 +429,25 @@ def print_solution_min(status):
     print("Status:", solver.StatusName(status))
     print("Objective:", solver.ObjectiveValue())
 
-    # ---- Truck arcs used (added) ----
-    print("\nTruck arcs used:")
-    for k in K:
-        used = [f"{i}->{j}" for i in range(num_nodes) for j in range(num_nodes)
-                if i != j and (k, i, j) in x and solver.Value(x[k, i, j]) == 1]
-        print(f"  Truck {k}: {used if used else 'None'}")
-
     # ---- Truck deliveries (nodes in VT) ----
     print("\nTruck deliveries:")
     found_truck_delivery = False
     for k in K:
         for j in VT:
+            # Check if any incoming arc exists and is selected
             incoming_arcs = []
             for i in VT.union({depot}):
-                if i != j and (k, i, j) in x and solver.Value(x[k, i, j]) == 1:
-                    incoming_arcs.append(i)
+                if i != j and (k, i, j) in x:
+                    if solver.Value(x[k, i, j]) == 1:
+                        incoming_arcs.append(i)
+            
             if len(incoming_arcs) == 1:
                 found_truck_delivery = True
-                t_arr = solver.Value(a[k, j]) if (k, j) in a else "N/A"
+                # Get arrival time if variable exists
+                if (k, j) in a:
+                    t_arr = solver.Value(a[k, j])
+                else:
+                    t_arr = "N/A"
                 print(f"  Truck {k} delivers to node {j} at time {t_arr}")
     if not found_truck_delivery:
         print("  None")
@@ -451,26 +455,29 @@ def print_solution_min(status):
     # ---- Drone flights ----
     print("\nDrone flights:")
     found_drone_flight = False
-    for (k, i, j, l), var in y_drone.items():
+    for key, var in y_drone.items():
         if solver.Value(var) == 1:
+            k, i, j, l = key
             found_drone_flight = True
+            # Get times if variables exist
             launch_t = solver.Value(a[k, i]) if (k, i) in a else "N/A"
             service_t = solver.Value(a_prime[k, j]) if (k, j) in a_prime else "N/A"
             rend_t = solver.Value(a[k, l]) if (k, l) in a else "N/A"
-            print(f"  Tandem {k}: launch {i} t={launch_t}, deliver {j} t={service_t}, rendezvous {l} t={rend_t}")
+            print(f"  Tandem {k}: launch from {i} at t={launch_t}, deliver to {j} at t={service_t}, rendezvous at {l} at t={rend_t}")
     if not found_drone_flight:
         print("  None")
 
-    # ---- Rendezvous events ----
+    # ---- Rendezvous summary ----
     print("\nRendezvous events:")
-    rendezvous = set()
-    for (k, i, j, l), var in y_drone.items():
+    rnd_events = set()
+    for key, var in y_drone.items():
         if solver.Value(var) == 1:
-            rendezvous.add((k, l))
-    if rendezvous:
-        for k, l in sorted(rendezvous):
+            k, i, j, l = key
+            rnd_events.add((k, l))
+    if rnd_events:
+        for k, l in sorted(rnd_events):
             rt = solver.Value(a[k, l]) if (k, l) in a else "N/A"
-            print(f"  Tandem {k} rendezvous at node {l} time={rt}")
+            print(f"  Tandem {k} at node {l}, time={rt}")
     else:
         print("  None")
 
